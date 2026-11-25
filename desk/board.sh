@@ -37,7 +37,7 @@ PY=/usr/bin/python3
 XIAO_FQBN="${XIAO_FQBN:-Seeeduino:nrf52:xiaonRF52840SensePlus}"   # a plain Sense: Seeeduino:nrf52:xiaonRF52840Sense
 ESP32_FQBN="${ESP32_FQBN:-esp32:esp32:esp32:UploadSpeed=230400}"   # faster than this garbles on some cables
 ESP32_BAUD="${ESP32_BAUD:-230400}"                                  # the same, for backup and restore
-PAD_FQBN="${PAD_FQBN:-esp32:esp32:esp32s3:CDCOnBoot=cdc,PSRAM=opi,FlashSize=16M,PartitionScheme=app3M_fat9M_16MB}"
+PAD_FQBN="${PAD_FQBN:-esp32:esp32:esp32s3:USBMode=default,CDCOnBoot=cdc,PSRAM=opi,FlashSize=16M,PartitionScheme=app3M_fat9M_16MB}"
 PAD_BAUD="${PAD_BAUD:-921600}"                                      # the S3's own USB: fast and clean
 SEEED_URL=https://files.seeedstudio.com/arduino/package_seeeduino_boards_index.json
 ESP32_URL=https://espressif.github.io/arduino-esp32/package_esp32_index.json

@@ -592,7 +592,7 @@ inline void home(uint16_t *f, const uint16_t *art, const bb::State &s, bool wait
     for (int k = 1; k < PX; k++) memcpy(row + k * W, row, W * sizeof(uint16_t));
   }
   if (waiting) {
-    fitted(f, 0, W, 12, "WAITING FOR THE MAC", 2, bb::DIM);
+    fitted(f, 0, W, 12, "WAITING FOR THE COMPUTER", 2, bb::DIM);
     return;
   }
   char how[12] = "";

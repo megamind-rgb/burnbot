@@ -13,3 +13,4 @@ research/gallery/*
 shots/
 # the old Claude Pad kit: flash backups and a copy of old settings
 claude_pad_kit/
+pad/__pycache__/

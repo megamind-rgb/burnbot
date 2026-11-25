@@ -19,6 +19,8 @@
 // Lines from the Mac (115200, each ends with a new line):
 //   V        answers "BURNBOT 6" (6: pages; 5 talks, listens and takes touch; 4 had keys)
 //   P        answers "OK"
+//   WF|..    Wi-Fi and pairing, WI its status (wifilink.h); USB only, like DL
+//   DL       restarts into flashing mode (the chip's own USB port), for updates without the BOOT button
 //   R        starts the display again, answers "OK"
 //   O0 / O2  answers "OK" (the keys are fixed under the screen, so it stays the right way up)
 //   B|...    what to show (render.h, and pad.h for ky=, pr=, pp=, wk=), answers "OK"
@@ -58,12 +60,43 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_ILI9341.h>
 #include <Preferences.h>
+#include "soc/rtc_cntl_reg.h"
 
 #include "pad.h"
 #include "es8311.h"
 #include "ft6336.h"
 #include "padaudio.h"
 #include "calib.h"
+#include "wifilink.h"
+
+// The pad's USB drive "BURNBOT": the Mac and Windows installers (drive.h, made by desk/tools/make_drive.py),
+// read-only. Needs USB in OTG mode (USBMode=default), which board.sh's PAD_FQBN sets.
+#if ARDUINO_USB_MODE == 0
+#include "USB.h"
+#include "USBMSC.h"
+#include "drive.h"
+USBMSC drive;
+static int32_t driveRead(uint32_t lba, uint32_t offset, void *buffer, uint32_t size) {
+  uint32_t at = lba * 512 + offset, n = at < DRIVE_USED ? min(size, DRIVE_USED - at) : 0;
+  memcpy(buffer, DRIVE + at, n);
+  memset((uint8_t *)buffer + n, 0, size - n);
+  return size;
+}
+static int32_t driveWrite(uint32_t, uint32_t, uint8_t *, uint32_t) { return -1; }
+// Before USB starts (the core starts it before setup()), so the drive is in the USB descriptor.
+static struct DriveAtBoot {
+  DriveAtBoot() {
+    drive.vendorID("Burnbot");
+    drive.productID("Pad installers");
+    drive.productRevision("6");
+    drive.onRead(driveRead);
+    drive.onWrite(driveWrite);
+    drive.isWritable(false);
+    drive.mediaPresent(true);
+    drive.begin(DRIVE_SECTORS, 512);
+  }
+} driveAtBoot;
+#endif
 
 // The board's wiring (lcdwiki.com, 2.8inch ESP32-S3 Display)
 const int LCD_CS = 10, LCD_DC = 46, LCD_SCK = 12, LCD_MOSI = 11, LCD_MISO = 13, LCD_BL = 45;
@@ -193,7 +226,8 @@ void show() {
     tft.writePixels(strip, n, true, true);   // big-endian already: goes out through writeBytes
     memcpy(shown + y * pd::W, frame + y * pd::W, rowBytes * (end - y));
     y = end;
-    if (au::recording) au::sendMic(Serial, 2);
+    if (au::recording) au::sendMic(computer, 2);
+    wl::pump();                             // keep Wi-Fi sound coming in while the frame goes out
   }
   tft.endWrite();
   allStale = false;
@@ -212,7 +246,7 @@ void startCalibration() {
   calSamples = calSum[0] = calSum[1] = 0;
   calLast[0] = calLast[1] = -999;
   calDoneAt = 0;
-  if (au::recording) au::cancelRecording(Serial);
+  if (au::recording) au::cancelRecording(computer);
   if (!lit) light(true);
 }
 
@@ -220,7 +254,7 @@ void endCalibration(const char *result) {
   live.calStep = -1;
   live.note[0] = 0;
   calDoneAt = 0;
-  if (result) Serial.println(result);
+  if (result) computer.println(result);
 }
 
 // A finger lifted at raw (rx, ry) during touch setup.
@@ -241,10 +275,10 @@ void calibrationTap(int rx, int ry) {
     remember();
     snprintf(live.note, sizeof live.note, "SAVED. OFF BY ABOUT %d PX", (int)(worst + 0.5f));
     calDoneAt = millis();                   // shows "done" for a moment, then back
-    Serial.printf("TC|ok|%d\n", (int)(worst + 0.5f));
+    computer.printf("TC|ok|%d\n", (int)(worst + 0.5f));
   } else {
     snprintf(live.note, sizeof live.note, "TRY AGAIN");
-    Serial.printf("TC|fail|%d\n", (int)(worst + 0.5f));
+    computer.printf("TC|fail|%d\n", (int)(worst + 0.5f));
     live.calStep = 0;
     calLast[0] = calLast[1] = -999;
   }
@@ -273,11 +307,11 @@ void startKeys() {
 void keyEvent(int i, bool down, uint32_t now) {
   if (!down && eaten[i]) {                  // the end of a press that was used up already
     eaten[i] = false;
-    if (i == 1 && au::recording) au::stopRecording(Serial, "up");
+    if (i == 1 && au::recording) au::stopRecording(computer, "up");
     return;
   }
   if (!down) {
-    Serial.printf("K%du\n", i + 1);
+    computer.printf("K%du\n", i + 1);
     return;
   }
   presses[i]++;
@@ -291,7 +325,7 @@ void keyEvent(int i, bool down, uint32_t now) {
     return;
   }
   if (au::recording) {                      // key 1 throws the recording away; the others wait
-    if (i == 0) au::cancelRecording(Serial);
+    if (i == 0) au::cancelRecording(computer);
     return;
   }
   if ((i == 0 || i == 3) && onPages(now)) { // key 1 / 4 with no labels: the previous / next page
@@ -299,13 +333,13 @@ void keyEvent(int i, bool down, uint32_t now) {
     return;
   }
   if (i == 1 && micOn(now)) {               // key 2 on a screen that listens
-    au::startRecording(Serial, ++recCount);
+    au::startRecording(computer, ++recCount);
     live.seconds = 0;
     memset(live.level, 0, sizeof live.level);
     return;
   }
   eaten[i] = false;
-  Serial.printf("K%dd\n", i + 1);
+  computer.printf("K%dd\n", i + 1);
 }
 
 // True when a key changed, so the frame shows it at once.
@@ -394,7 +428,7 @@ int levelMax = 0;
 
 void tickSound(uint32_t now) {
   if (!audioOk) return;
-  au::poll(Serial);
+  au::poll(computer);
   if (beepsLeft && now >= beepAt) {
     au::tone(2000, 70, 25);
     beepsLeft--;
@@ -402,7 +436,7 @@ void tickSound(uint32_t now) {
   }
   live.recording = au::recording;
   if (!au::recording) return;
-  au::sendMic(Serial, 8);
+  au::sendMic(computer, 8);
   int l = au::level;
   if (l > levelMax) levelMax = l;
   if (now - levelAt >= 100) {               // one bar of the meter each 100 ms
@@ -414,7 +448,7 @@ void tickSound(uint32_t now) {
   }
   live.seconds = (int)((now - au::recStarted) / 1000);
   if (now - au::recStarted > LONGEST_TALK_MS) {
-    au::stopRecording(Serial, "max");
+    au::stopRecording(computer, "max");
     // key 2 is still held: its release should send nothing, which eaten[1] already sees to
   }
 }
@@ -431,7 +465,7 @@ void tickBattery(uint32_t now) {
   batteryMv = (int)(sum / 16 * 2);
   if (abs(batteryMv - batterySent) > 25) {
     batterySent = batteryMv;
-    Serial.printf("BT|%d\n", batteryMv);
+    computer.printf("BT|%d\n", batteryMv);
   }
 }
 
@@ -439,9 +473,9 @@ void tickBattery(uint32_t now) {
 void status() {
   // No reading from the display here: its ID query (command 0xD9) leaves this panel drawing
   // every row along its top edge until it is set up again.
-  Serial.printf("display: ILI9341, psram %u, keys:", (unsigned)ESP.getPsramSize());
-  for (int i = 0; i < 4; i++) Serial.printf(" %d=%s(%lu)", i + 1, keyDown[i] ? "down" : "up", (unsigned long)presses[i]);
-  Serial.printf(", codec %s, touch %s%s, sound %s, vol %d, gain %d, battery %d mV\n", codecOk ? "ok" : "none",
+  computer.printf("display: ILI9341, psram %u, keys:", (unsigned)ESP.getPsramSize());
+  for (int i = 0; i < 4; i++) computer.printf(" %d=%s(%lu)", i + 1, keyDown[i] ? "down" : "up", (unsigned long)presses[i]);
+  computer.printf(", codec %s, touch %s%s, sound %s, vol %d, gain %d, battery %d mV\n", codecOk ? "ok" : "none",
                 touchOk ? "ok" : "none", calibrated ? " (calibrated)" : "", audioOk ? "ok" : "none", volume, gain,
                 batteryMv);
 }
@@ -449,105 +483,118 @@ void status() {
 void handle(char *text) {
   if (!text[0]) return;
   const size_t len = strlen(text);
-  if (!strcmp(text, "V")) { Serial.println("BURNBOT 6"); return; }
-  if (!strcmp(text, "P")) { Serial.println("OK"); return; }
+  if (!strcmp(text, "V")) { computer.println("BURNBOT 6"); return; }
+  if (!strcmp(text, "P")) { computer.println("OK"); return; }
+  if (!strncmp(text, "WF|", 3) || !strcmp(text, "DL")) {   // USB only: pairing and flashing
+    if (wl::active) { computer.println("ERR"); return; }
+  }
+  if (!strncmp(text, "WF|", 3)) { wl::pair(text + 3, computer); return; }
+  if (!strcmp(text, "WI")) { wl::status(computer); return; }
+  if (!strcmp(text, "DL")) {                 // restart into the chip's own flashing mode: updates need no BOOT button
+    computer.println("OK");
+    Serial.flush();
+    delay(100);
+    REG_WRITE(RTC_CNTL_OPTION1_REG, RTC_CNTL_FORCE_DOWNLOAD_BOOT);
+    esp_restart();
+  }
   if (!strcmp(text, "s")) { status(); return; }
-  if (!strcmp(text, "R")) { startDisplay(); light(lit); Serial.println("OK"); return; }
+  if (!strcmp(text, "R")) { startDisplay(); light(lit); computer.println("OK"); return; }
   if (!strcmp(text, "Q")) {
-    Serial.printf("Q|o=0|s=%d|w=%d|k=0|n=1|y=4|t=%d|a=%d|c=%d|b=%d|v=%d\n", (int)state.look, waiting ? 1 : 0,
+    computer.printf("Q|o=0|s=%d|w=%d|k=0|n=1|y=4|t=%d|a=%d|c=%d|b=%d|v=%d\n", (int)state.look, waiting ? 1 : 0,
                   touchOk ? 1 : 0, audioOk && codecOk ? 1 : 0, calibrated ? 1 : 0, batteryMv, volume);
     return;
   }
-  if (audioOk && au::playLine(text, Serial)) return;          // PL|, PE, PX
-  if (!strcmp(text, "PE") || !strcmp(text, "PX")) { Serial.println("PD|done"); return; }   // no sound here
+  if (audioOk && au::playLine(text, computer)) return;          // PL|, PE, PX
+  if (!strcmp(text, "PE") || !strcmp(text, "PX")) { computer.println("PD|done"); return; }   // no sound here
   if (!strncmp(text, "PL|", 3)) return;
-  if (!strcmp(text, "RX")) { au::cancelRecording(Serial); Serial.println("OK"); return; }
+  if (!strcmp(text, "RX")) { au::cancelRecording(computer); computer.println("OK"); return; }
   if (!strcmp(text, "TC")) {
-    if (!touchOk) { Serial.println("TC|fail|0"); return; }
+    if (!touchOk) { computer.println("TC|fail|0"); return; }
     startCalibration();
-    Serial.println("OK");
+    computer.println("OK");
     return;
   }
   if (!strncmp(text, "S|", 2)) {
     pd::Screen next;
-    if (!pd::parseScreen(text, next)) { Serial.println("ERR"); return; }
+    if (!pd::parseScreen(text, next)) { computer.println("ERR"); return; }
     screen = next;
     screenAt = millis();
-    if (!screen.mic && au::recording) au::cancelRecording(Serial);
-    Serial.println("OK");
+    if (!screen.mic && au::recording) au::cancelRecording(computer);
+    computer.println("OK");
     return;
   }
   if (!strncmp(text, "VL|", 3)) {
     volume = constrain(atoi(text + 3), 0, 100);
     if (codecOk) es::volume(volume);
     remember();
-    Serial.println("OK");
+    computer.println("OK");
     return;
   }
   if (!strncmp(text, "MG|", 3)) {
     gain = constrain(atoi(text + 3), 0, 7);
     if (codecOk) es::micGain(gain);
     remember();
-    Serial.println("OK");
+    computer.println("OK");
     return;
   }
   if (!strncmp(text, "BZ|", 3)) {
     beepsLeft = constrain(atoi(text + 3), 0, 5);
     beepAt = millis();
-    Serial.println("OK");
+    computer.println("OK");
     return;
   }
   if (len == 2 && ((text[0] == 'O' && (text[1] == '0' || text[1] == '2')) || (text[0] == 'S' && text[1] >= '0' && text[1] <= '2'))) {
-    Serial.println("OK");
+    computer.println("OK");
     return;
   }
   if (len == 2 && text[0] == 'L' && text[1] >= '0' && text[1] <= '9') {
     brightness = text[1] - '0';
     remember();
     if (lit) light(true);
-    Serial.println("OK");
+    computer.println("OK");
     return;
   }
   if (!strncmp(text, "U|", 2)) {
     pd::Usage next;
-    if (!pd::parseUsage(text, next)) { Serial.println("ERR"); return; }
+    if (!pd::parseUsage(text, next)) { computer.println("ERR"); return; }
     usage = next;
-    Serial.println("OK");
+    computer.println("OK");
     return;
   }
   if (!strncmp(text, "D|", 2)) {
     pd::Today next;
-    if (!pd::parseToday(text, next)) { Serial.println("ERR"); return; }
+    if (!pd::parseToday(text, next)) { computer.println("ERR"); return; }
     today = next;
-    Serial.println("OK");
+    computer.println("OK");
     return;
   }
   if (!strncmp(text, "M|", 2)) {
     bb::Moment said;
-    if (!bb::parseMoment(text, said)) { Serial.println("ERR"); return; }
+    if (!bb::parseMoment(text, said)) { computer.println("ERR"); return; }
     moment = said;
-    Serial.println("OK");
+    computer.println("OK");
     return;
   }
   if (!strncmp(text, "B|", 2)) {
     bb::State next;
     pd::Pad keys;
-    if (!bb::parse(text, next) || !pd::parsePad(text, keys)) { Serial.println("ERR"); return; }
+    if (!bb::parse(text, next) || !pd::parsePad(text, keys)) { computer.println("ERR"); return; }
     state = next;
     pad = keys;
     heardAt = millis();
     waiting = false;
     if (!lit) light(true);
-    Serial.println("OK");
+    computer.println("OK");
     return;
   }
-  Serial.println("ERR");
+  computer.println("ERR");
 }
 
 void readMac() {
   static uint8_t buf[512];
   size_t n;
   while ((n = Serial.available()) > 0) {
+    wl::active = false;                     // the computer is on USB: answer there
     n = Serial.read(buf, n < sizeof buf ? n : sizeof buf);
     for (size_t i = 0; i < n; i++) {
       char c = (char)buf[i];
@@ -564,8 +611,15 @@ void readMac() {
 
 void setup() {
   Serial.setRxBufferSize(16384);            // sound comes in at about 43 KB a second
-  Serial.setTxBufferSize(16384);            // and goes out at about the same
+#if ARDUINO_USB_MODE == 1
+  Serial.setTxBufferSize(16384);            // and goes out at about the same (HW CDC only)
+#endif
   Serial.setTxTimeoutMs(0);                 // with nobody listening, drop what it says rather than wait
+#if ARDUINO_USB_MODE == 0
+  // OTG mode: TinyUSB's send buffer is 64 bytes, so a sound line (~870) needs to wait for the computer to read.
+  // Safe: with no program holding the port open (DTR off), the core sends nothing and does not wait.
+  Serial.setTxTimeoutMs(100);
+#endif
   Serial.begin(115200);
   pinMode(LCD_BL, OUTPUT);
   startKeys();
@@ -587,21 +641,24 @@ void setup() {
   audioOk = au::begin(why);
   codecOk = es::begin(Wire, 0x18, volume, gain);
   touchOk = ft::begin(Wire, ft::resetPin, ft::intPin);
-  if (!audioOk) Serial.printf("sound: %s\n", why.c_str());
+  if (!audioOk) computer.printf("sound: %s\n", why.c_str());
   tickBattery(millis());
   if (touchOk && keyDown[2]) {              // key 3 held while it starts: touch setup
     startCalibration();
     eaten[2] = true;
   }
   status();
+  wl::load();
 }
 
 void loop() {
   readMac();
+  wl::poll(millis());                      // before `now`: a line stamps heardAt, which must not be later than now
   uint32_t now = millis();
   bool pressed = checkKeys(now);
   pressed |= checkTouch(now);
   tickSound(now);
+  wl::awake(au::recording || au::playing || (au::fedAt && now - au::fedAt < 1500));   // sound needs the radio awake
   tickBattery(now);
 
   if (!waiting && now - heardAt > QUIET_MS) {   // the Mac went quiet (asleep, or Burnbot quit)
@@ -609,7 +666,7 @@ void loop() {
     moment = bb::Moment();
     pad = pd::Pad();
     screenAt = 0;
-    if (au::recording) au::stopRecording(Serial, "lost");
+    if (au::recording) au::stopRecording(computer, "lost");
     if (audioOk) au::stopPlaying();
   }
   if (calDoneAt && now - calDoneAt > 2500) endCalibration(nullptr);
